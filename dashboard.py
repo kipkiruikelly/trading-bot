@@ -380,5 +380,5 @@ def index():
 
 
 if __name__ == "__main__":
-    print("Dashboard running at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print("Dashboard running at http://localhost:8080")
+    app.run(host="0.0.0.0", port=8080, debug=False)
