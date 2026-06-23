@@ -124,9 +124,11 @@ def train(csv_path: str = "backtest_results.csv"):
         random_state=42,
     )
 
+    accuracy = None
     if len(df) >= MIN_TRADES:
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
+        accuracy = float(scores.mean())
         log.info("Cross-val accuracy: %.1f%% ± %.1f%%",
                  scores.mean() * 100, scores.std() * 100)
 
@@ -136,6 +138,7 @@ def train(csv_path: str = "backtest_results.csv"):
         pickle.dump({"model": model, "features": FEATURES, "threshold": THRESHOLD}, f)
 
     log.info("Model trained on %d trades → saved to %s", len(df), MODEL_PATH)
+    return accuracy
 
     # Feature importance
     importances = sorted(zip(FEATURES, model.feature_importances_),

@@ -14,6 +14,7 @@ import MetaTrader5 as mt5
 
 from config import MAGIC, SYMBOL
 from ml_filter import FEATURES, train
+from telegram_alerts import alert_trade_closed, alert_model_retrained
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +80,12 @@ class TradeTracker:
             log.info("Live trade closed | pos: %s | result: %s | pnl_pts: %+.1f",
                      pos_id, outcome["result"], outcome["pnl_points"])
 
+            alert_trade_closed(
+                int(pos_id),
+                outcome["result"],
+                outcome["pnl_points"],
+                data["direction"],
+            )
             if self._journal:
                 self._journal.log_exit(
                     int(pos_id),
@@ -95,7 +102,9 @@ class TradeTracker:
     def retrain_and_reload(self) -> dict | None:
         """Retrain the model and return the freshly loaded model dict."""
         log.info("Retraining model on %d new live trades...", self._new_since_retrain)
-        train(str(self.csv_path))
+        accuracy = train(str(self.csv_path))
+        total    = sum(1 for _ in open(self.csv_path)) - 1
+        alert_model_retrained(total, accuracy)
         self._new_since_retrain = 0
         from ml_filter import load_model
         return load_model()

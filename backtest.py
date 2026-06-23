@@ -10,6 +10,7 @@ import matplotlib.dates as mdates
 from config import SYMBOL, SWING_LOOKBACK, FVG_LOOKBACK, MIN_RR, SL_BUFFER
 from ml_filter import extract_features, FEATURES
 from journal import TradeJournal
+from telegram_alerts import alert_backtest_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -585,6 +586,19 @@ def run_backtest(date_from: datetime, date_to: datetime):
     print_session_table(trades)
     export_csv(trades)
     plot_equity_curve(trades)
+
+    if trades:
+        wins   = [t for t in trades if t["result"] == "win"]
+        losses = [t for t in trades if t["result"] == "loss"]
+        net    = sum(t["pnl_points"] for t in trades)
+        gain   = sum(t["pnl_points"] for t in wins)
+        loss   = abs(sum(t["pnl_points"] for t in losses))
+        pf     = gain / loss if loss > 0 else float("inf")
+        alert_backtest_summary(
+            len(trades), len(wins), len(losses),
+            len(wins) / len(trades) * 100, net, pf,
+        )
+
     mt5.shutdown()
 
 

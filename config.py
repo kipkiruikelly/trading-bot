@@ -1,5 +1,8 @@
 DRY_RUN = True  # set to False to place real trades
 
+TELEGRAM_TOKEN   = ""   # from @BotFather  e.g. "123456:ABC-DEF..."
+TELEGRAM_CHAT_ID = ""   # from @userinfobot e.g. "987654321"
+
 SYMBOL = "US100"
 YF_TICKER = "^NDX"          # Yahoo Finance ticker for NAS100
 STRUCTURE_TF = "M15"

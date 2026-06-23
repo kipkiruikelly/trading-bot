@@ -11,6 +11,9 @@ from risk import calculate_lot_size, calculate_tp
 from ml_filter import extract_features, load_model, should_take_trade
 from trade_tracker import TradeTracker
 from journal import TradeJournal
+from telegram_alerts import (alert_bot_started, alert_bot_stopped,
+                              alert_signal, alert_trade_placed,
+                              alert_ml_rejected)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,6 +101,7 @@ def run():
 
     mode = "DRY RUN (no real trades)" if DRY_RUN else "LIVE TRADING"
     log.info("Bot started — %s | watching %s", mode, SYMBOL)
+    alert_bot_started(mode)
 
     ml_model = load_model()
     if ml_model:
@@ -162,11 +166,14 @@ def run():
             features    = extract_features(mss, fvg, df_15m, signal_time)
 
             # --- ML filter ---
+            prob = None
             if ml_model:
                 take, prob = should_take_trade(features, ml_model)
                 if not take:
                     log.info("ML filter rejected | win prob: %.1f%% (min: %.0f%%)",
                              prob * 100, ml_model.get("threshold", 0.60) * 100)
+                    alert_ml_rejected(mss["direction"], prob,
+                                      ml_model.get("threshold", 0.60))
                     mss_cache = mss_key
                     time.sleep(10)
                     continue
@@ -204,8 +211,12 @@ def run():
 
             tp = calculate_tp(entry, sl, direction)
 
+            rr = round(abs(tp - entry) / abs(entry - sl), 1) if abs(entry - sl) > 0 else 0
             log.info("Entering trade | direction: %s | entry: %.2f | SL: %.2f | TP: %.2f",
                      direction, entry, sl, tp)
+
+            # Signal alert before placing order
+            alert_signal(direction, active_session(), entry, sl, tp, rr, prob)
 
             position_ticket = place_order(direction, entry, sl, tp)
             mss_cache = mss_key
@@ -219,6 +230,17 @@ def run():
                     position_ticket, df_15m, mss, fvg,
                     entry, sl, tp, direction, signal_time, features,
                 )
+                # Send trade placed alert with chart screenshot
+                from journal import SCREENSHOTS_DIR
+                screenshot = journal.trades.get(str(position_ticket), {}).get("screenshot")
+                screenshot_path = SCREENSHOTS_DIR / screenshot if screenshot else None
+                lot = calculate_lot_size(abs(entry - sl))
+                alert_trade_placed(direction, entry, sl, tp, lot,
+                                   position_ticket, screenshot_path, DRY_RUN)
+            elif DRY_RUN:
+                lot = calculate_lot_size(abs(entry - sl))
+                alert_trade_placed(direction, entry, sl, tp, lot,
+                                   0, dry_run=True)
 
             time.sleep(60)  # cooldown after placing trade
 
@@ -230,6 +252,7 @@ def run():
 
         except KeyboardInterrupt:
             log.info("Bot stopped by user")
+            alert_bot_stopped()
             break
         except Exception as e:
             log.error("Unexpected error: %s", e, exc_info=True)
