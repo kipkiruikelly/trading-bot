@@ -1,7 +1,9 @@
+import json
 import time
 import logging
 import MetaTrader5 as mt5
 from datetime import datetime, timezone
+from pathlib import Path
 
 from config import SYMBOL, STRUCTURE_TF, MAGIC, SLIPPAGE, DRY_RUN
 from killzone import in_kill_zone, active_session
@@ -24,6 +26,53 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+STATUS_FILE = Path("status.json")
+
+
+def write_status(mode: str, ml_active: bool):
+    try:
+        account   = mt5.account_info()
+        tick      = mt5.symbol_info_tick(SYMBOL)
+        positions = mt5.positions_get(symbol=SYMBOL) or []
+
+        open_pos = []
+        for p in positions:
+            if p.magic != MAGIC:
+                continue
+            direction = "bullish" if p.type == mt5.ORDER_TYPE_BUY else "bearish"
+            open_pos.append({
+                "ticket":        p.ticket,
+                "direction":     direction,
+                "entry":         round(p.price_open, 2),
+                "current_price": round(p.price_current, 2),
+                "sl":            round(p.sl, 2),
+                "tp":            round(p.tp, 2),
+                "profit":        round(p.profit, 2),
+                "open_time":     datetime.fromtimestamp(p.time,
+                                 tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            })
+
+        status = {
+            "bot_mode":       mode,
+            "symbol":         SYMBOL,
+            "ml_active":      ml_active,
+            "session":        active_session(),
+            "in_kill_zone":   in_kill_zone(),
+            "last_updated":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "current_price":  round(tick.bid, 2) if tick else None,
+            "account": {
+                "balance":    round(account.balance, 2),
+                "equity":     round(account.equity, 2),
+                "margin_free": round(account.margin_free, 2),
+                "profit":     round(account.profit, 2),
+            } if account else {},
+            "open_positions": open_pos,
+        }
+        STATUS_FILE.write_text(json.dumps(status, indent=2))
+    except Exception as exc:
+        log.debug("Status write failed: %s", exc)
 
 
 def connect():
@@ -116,6 +165,8 @@ def run():
 
     while True:
         try:
+            write_status("DRY RUN" if DRY_RUN else "LIVE", ml_model is not None)
+
             if not in_kill_zone():
                 log.debug("Outside kill zone (%s UTC) — waiting", datetime.now(timezone.utc).strftime("%H:%M"))
                 mss_cache = None  # reset between sessions
