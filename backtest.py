@@ -149,6 +149,9 @@ def simulate_trade(df_1m: pd.DataFrame, fvg: dict, direction: str, sl: float) ->
         c = df_1m.iloc[i]
 
         if not retrace_found:
+            # Abandon if kill zone has ended before price retraces
+            if not in_kill_zone_ts(c["time"]):
+                break
             in_fvg = fvg["bottom"] <= c["low"] <= fvg["top"] or fvg["bottom"] <= c["high"] <= fvg["top"]
             if in_fvg:
                 retrace_found = True
@@ -548,6 +551,11 @@ def run_backtest(date_from: datetime, date_to: datetime):
 
         fvg = find_fvg_slice(df_1m_fwd, mss["direction"])
         if fvg is None:
+            continue
+
+        # FVG must form within the kill zone
+        if not in_kill_zone_ts(fvg["time"]):
+            log.debug("FVG outside kill zone (%s) — skipping", fvg["time"])
             continue
 
         trade = simulate_trade(df_1m_fwd, fvg, mss["direction"], mss["sl"])

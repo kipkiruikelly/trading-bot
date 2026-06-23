@@ -186,6 +186,13 @@ def run():
                 time.sleep(5)
                 continue
 
+            # Kill zone must still be active at the moment of entry
+            if not in_kill_zone():
+                log.info("Kill zone ended before retrace completed — setup abandoned")
+                mss_cache = mss_key
+                time.sleep(30)
+                continue
+
             # --- Entry ---
             direction = mss["direction"]
             entry = tick.ask if direction == "bullish" else tick.bid
