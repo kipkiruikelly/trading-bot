@@ -1,6 +1,7 @@
 import csv
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -27,6 +28,22 @@ LONDON_END = (10, 0)
 NY_START = (13, 30)
 NY_END = (16, 0)
 
+DATA_DIR = Path("data")
+
+# Map MT5 timeframe constants → string names used for Parquet filenames.
+# Evaluated lazily inside fetch_data so the dict is built after mt5 is imported.
+_TF_NAMES: dict | None = None
+
+
+def _tf_names() -> dict:
+    global _TF_NAMES
+    if _TF_NAMES is None:
+        _TF_NAMES = {
+            mt5.TIMEFRAME_M1:  "M1",
+            mt5.TIMEFRAME_M15: "M15",
+        }
+    return _TF_NAMES
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,6 +61,29 @@ def in_kill_zone_ts(dt: datetime) -> bool:
 
 
 def fetch_data(tf_mt5: int, date_from: datetime, date_to: datetime) -> pd.DataFrame:
+    tf_str = _tf_names().get(tf_mt5)
+
+    # --- Try local Parquet first ---
+    if tf_str:
+        path = DATA_DIR / f"{SYMBOL}_{tf_str}.parquet"
+        if path.exists():
+            log.info("Loading %s %s from local store: %s", SYMBOL, tf_str, path)
+            df = pd.read_parquet(path)
+            ts_from = pd.Timestamp(date_from).tz_localize("UTC") \
+                      if date_from.tzinfo is None else pd.Timestamp(date_from)
+            ts_to   = pd.Timestamp(date_to).tz_localize("UTC") \
+                      if date_to.tzinfo is None else pd.Timestamp(date_to)
+            df = df[(df["time"] >= ts_from) & (df["time"] <= ts_to)]
+            if not df.empty:
+                log.info("  ↳ %d candles  (%s → %s)",
+                         len(df),
+                         df["time"].iloc[0].strftime("%Y-%m-%d"),
+                         df["time"].iloc[-1].strftime("%Y-%m-%d"))
+                return df.reset_index(drop=True)
+            log.warning("Local Parquet exists but date range [%s, %s] not covered — "
+                        "falling back to live MT5", date_from.date(), date_to.date())
+
+    # --- Live MT5 fallback ---
     rates = mt5.copy_rates_range(SYMBOL, tf_mt5, date_from, date_to)
     if rates is None or len(rates) == 0:
         return pd.DataFrame()
@@ -507,9 +547,16 @@ def export_csv(trades: list, path: str = "backtest_results.csv"):
 # ---------------------------------------------------------------------------
 
 def run_backtest(date_from: datetime, date_to: datetime):
-    if not mt5.initialize():
-        log.error("MT5 init failed: %s", mt5.last_error())
-        return
+    mt5_ok = mt5.initialize()
+    if not mt5_ok:
+        m15_ok = (DATA_DIR / f"{SYMBOL}_M15.parquet").exists()
+        m1_ok  = (DATA_DIR / f"{SYMBOL}_M1.parquet").exists()
+        if not (m15_ok and m1_ok):
+            log.error("MT5 init failed (%s) and no local Parquet data found.",
+                      mt5.last_error())
+            log.error("Either start MT5 or run:  python data_store.py")
+            return
+        log.warning("MT5 not available — running entirely from local Parquet store")
 
     log.info("Fetching %s data: %s → %s", SYMBOL, date_from.date(), date_to.date())
 
@@ -599,7 +646,8 @@ def run_backtest(date_from: datetime, date_to: datetime):
             len(wins) / len(trades) * 100, net, pf,
         )
 
-    mt5.shutdown()
+    if mt5_ok:
+        mt5.shutdown()
 
 
 if __name__ == "__main__":

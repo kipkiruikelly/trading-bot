@@ -18,5 +18,8 @@ equity_curve.png
 # Journal (regenerated at runtime)
 journal/
 
+# Local data store (Parquet files — can be GBs, never commit)
+data/
+
 # macOS
 .DS_Store
