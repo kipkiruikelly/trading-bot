@@ -9,6 +9,7 @@ venv/
 # Bot runtime files
 model.pkl
 pending_trades.json
+status.json
 bot.log
 backtest.log
 backtest_results.csv
