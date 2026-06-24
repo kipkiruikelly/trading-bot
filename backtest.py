@@ -40,6 +40,7 @@ def _tf_names() -> dict:
     if _TF_NAMES is None:
         _TF_NAMES = {
             mt5.TIMEFRAME_M1:  "M1",
+            mt5.TIMEFRAME_M5:  "M5",
             mt5.TIMEFRAME_M15: "M15",
         }
     return _TF_NAMES
@@ -178,11 +179,31 @@ def find_fvg_slice(df: pd.DataFrame, direction: str) -> dict | None:
 # Trade simulation
 # ---------------------------------------------------------------------------
 
+def _atr_1m(df_1m: pd.DataFrame, idx: int, period: int = 14) -> float:
+    start = max(0, idx - period)
+    sl = df_1m.iloc[start:idx + 1]
+    prev_close = sl["close"].shift(1)
+    tr = pd.concat([sl["high"] - sl["low"],
+                    (sl["high"] - prev_close).abs(),
+                    (sl["low"]  - prev_close).abs()], axis=1).max(axis=1)
+    val = tr.mean()
+    return float(val) if not pd.isna(val) else 20.0
+
+
 def simulate_trade(df_1m: pd.DataFrame, fvg: dict, direction: str, sl: float) -> dict | None:
-    sl_dist = abs(fvg["mid"] - sl)
-    tp_dist = sl_dist * MIN_RR
+    # Use ATR-based SL (1.5× ATR on 1m) so targets are reachable within a session.
+    # The sweep-level SL from detect_mss_slice can be hundreds of points away,
+    # making TP unreachable when NDX only moves 100-200 pts per day.
+    atr = _atr_1m(df_1m, fvg["index"])
+    sl_dist = max(1.5 * atr, abs(fvg["mid"] - fvg["bottom"]))  # at least FVG half-width
     entry = fvg["mid"]
-    tp = entry + tp_dist if direction == "bullish" else entry - tp_dist
+    tp_dist = sl_dist * MIN_RR
+    if direction == "bullish":
+        sl = entry - sl_dist
+        tp = entry + tp_dist
+    else:
+        sl = entry + sl_dist
+        tp = entry - tp_dist
 
     retrace_found = False
 
@@ -546,22 +567,28 @@ def export_csv(trades: list, path: str = "backtest_results.csv"):
 # Main backtest loop
 # ---------------------------------------------------------------------------
 
-def run_backtest(date_from: datetime, date_to: datetime):
+def run_backtest(date_from: datetime, date_to: datetime, entry_tf: int = None):
+    if entry_tf is None:
+        entry_tf = mt5.TIMEFRAME_M1
+
+    entry_tf_name = _tf_names().get(entry_tf, "M1")
+
     mt5_ok = mt5.initialize()
     if not mt5_ok:
-        m15_ok = (DATA_DIR / f"{SYMBOL}_M15.parquet").exists()
-        m1_ok  = (DATA_DIR / f"{SYMBOL}_M1.parquet").exists()
-        if not (m15_ok and m1_ok):
+        m15_ok   = (DATA_DIR / f"{SYMBOL}_M15.parquet").exists()
+        entry_ok = (DATA_DIR / f"{SYMBOL}_{entry_tf_name}.parquet").exists()
+        if not (m15_ok and entry_ok):
             log.error("MT5 init failed (%s) and no local Parquet data found.",
                       mt5.last_error())
-            log.error("Either start MT5 or run:  python data_store.py")
+            log.error("Either start MT5 or run:  python download_data.py")
             return
         log.warning("MT5 not available — running entirely from local Parquet store")
 
-    log.info("Fetching %s data: %s → %s", SYMBOL, date_from.date(), date_to.date())
+    log.info("Fetching %s data: %s → %s  (entry TF: %s)",
+             SYMBOL, date_from.date(), date_to.date(), entry_tf_name)
 
     df_15m = fetch_data(mt5.TIMEFRAME_M15, date_from, date_to)
-    df_1m  = fetch_data(mt5.TIMEFRAME_M1,  date_from, date_to)
+    df_1m  = fetch_data(entry_tf,          date_from, date_to)
 
     if df_15m.empty or df_1m.empty:
         log.error("No data returned — check symbol name and date range")
@@ -592,19 +619,24 @@ def run_backtest(date_from: datetime, date_to: datetime):
         if mss_key in mss_cache:
             continue
 
-        # 1m candles from this point forward
+        # Entry-TF candles from this point forward, limited to kill zone only
+        # for FVG detection (so we don't pick up FVGs after the session ends)
         df_1m_fwd = df_1m[df_1m["time"] >= candle_time].reset_index(drop=True)
         if df_1m_fwd.empty:
             continue
 
-        fvg = find_fvg_slice(df_1m_fwd, mss["direction"])
+        df_kz = df_1m_fwd[df_1m_fwd["time"].apply(in_kill_zone_ts)].reset_index(drop=True)
+        fvg = find_fvg_slice(df_kz, mss["direction"])
         if fvg is None:
             continue
 
-        # FVG must form within the kill zone
-        if not in_kill_zone_ts(fvg["time"]):
-            log.debug("FVG outside kill zone (%s) — skipping", fvg["time"])
+        # Map the FVG index back to df_1m_fwd so simulate_trade can see post-KZ bars
+        # for trade resolution (TP/SL can be hit after the session)
+        fvg_time = fvg["time"]
+        match = df_1m_fwd[df_1m_fwd["time"] == fvg_time]
+        if match.empty:
             continue
+        fvg["index"] = match.index[0]
 
         trade = simulate_trade(df_1m_fwd, fvg, mss["direction"], mss["sl"])
         if trade is None:
@@ -651,6 +683,6 @@ def run_backtest(date_from: datetime, date_to: datetime):
 
 
 if __name__ == "__main__":
-    FROM = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    TO   = datetime(2024, 6, 30, tzinfo=timezone.utc)
-    run_backtest(FROM, TO)
+    FROM = datetime(2026, 3, 27, tzinfo=timezone.utc)
+    TO   = datetime(2026, 6, 23, tzinfo=timezone.utc)
+    run_backtest(FROM, TO, entry_tf=mt5.TIMEFRAME_M5)

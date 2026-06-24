@@ -8,12 +8,14 @@ Usage:
     Then open http://localhost:8080
 """
 
+import csv
+import io
 import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, send_file
 
 try:
     import MetaTrader5 as mt5
@@ -23,8 +25,10 @@ except ImportError:
 
 app = Flask(__name__)
 
-STATUS_FILE  = Path("status.json")
-TRADES_FILE  = Path("journal/trades.json")
+STATUS_FILE       = Path("status.json")
+TRADES_FILE       = Path("journal/trades.json")
+BACKTEST_CSV      = Path("backtest_results.csv")
+EQUITY_CURVE_FILE = Path("equity_curve.png")
 
 _mt5_lock  = threading.Lock()
 _mt5_state = {"connected": False}
@@ -263,6 +267,7 @@ canvas{max-height:220px}
   <h1>ICT 2022 — US100 Dashboard</h1>
   <span class="badge dry" id="mode-badge">—</span>
   <span id="session-badge" style="font-size:.8rem;color:#8b949e">—</span>
+  <a href="/backtest" style="margin-left:12px;padding:4px 14px;border-radius:12px;background:#1f6feb;color:#fff;font-size:.75rem;font-weight:700;text-decoration:none">Backtest</a>
   <span class="updated" id="last-updated">—</span>
 </header>
 
@@ -661,6 +666,299 @@ setInterval(refresh, 10000);
 @app.route("/")
 def index():
     return render_template_string(TEMPLATE)
+
+
+# ---------------------------------------------------------------------------
+# Backtest endpoints
+# ---------------------------------------------------------------------------
+
+def _load_backtest_csv() -> list[dict]:
+    if not BACKTEST_CSV.exists():
+        return []
+    rows = []
+    with open(BACKTEST_CSV, newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    return rows
+
+
+def _backtest_stats(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    wins   = [r for r in rows if r.get("result") == "win"]
+    losses = [r for r in rows if r.get("result") == "loss"]
+    total  = len(rows)
+    gain   = sum(float(r["pnl_points"]) for r in wins)
+    loss   = abs(sum(float(r["pnl_points"]) for r in losses))
+    net    = sum(float(r["pnl_points"]) for r in rows)
+    pf     = round(gain / loss, 2) if loss > 0 else None
+
+    running = peak = max_dd = 0.0
+    equity  = [0.0]
+    for r in rows:
+        running += float(r["pnl_points"])
+        equity.append(round(running, 2))
+        peak   = max(peak, running)
+        max_dd = max(max_dd, peak - running)
+
+    # monthly breakdown
+    monthly: dict[str, dict] = {}
+    for r in rows:
+        key = r["time"][:7]
+        m   = monthly.setdefault(key, {"month": key, "trades": 0, "wins": 0, "losses": 0, "net": 0.0})
+        m["trades"] += 1
+        m["net"]    += float(r["pnl_points"])
+        if r["result"] == "win":
+            m["wins"] += 1
+        else:
+            m["losses"] += 1
+    for m in monthly.values():
+        m["net"]      = round(m["net"], 2)
+        m["win_rate"] = round(m["wins"] / m["trades"] * 100, 1) if m["trades"] else 0.0
+
+    # session breakdown
+    sessions: dict[str, dict] = {}
+    for r in rows:
+        s = r.get("session", "Unknown")
+        d = sessions.setdefault(s, {"session": s, "trades": 0, "wins": 0, "losses": 0, "net": 0.0})
+        d["trades"] += 1
+        d["net"]    += float(r["pnl_points"])
+        if r["result"] == "win":
+            d["wins"] += 1
+        else:
+            d["losses"] += 1
+    for d in sessions.values():
+        d["net"]      = round(d["net"], 2)
+        d["win_rate"] = round(d["wins"] / d["trades"] * 100, 1) if d["trades"] else 0.0
+
+    return {
+        "total":    total,
+        "wins":     len(wins),
+        "losses":   len(losses),
+        "win_rate": round(len(wins) / total * 100, 1),
+        "net":      round(net, 2),
+        "profit_factor": pf,
+        "max_dd":   round(max_dd, 2),
+        "equity":   equity,
+        "monthly":  sorted(monthly.values(), key=lambda x: x["month"]),
+        "sessions": list(sessions.values()),
+        "trades":   rows[-50:][::-1],  # last 50, newest first
+    }
+
+
+@app.route("/api/backtest")
+def api_backtest():
+    rows = _load_backtest_csv()
+    return jsonify(_backtest_stats(rows))
+
+
+@app.route("/backtest/chart")
+def backtest_chart():
+    if not EQUITY_CURVE_FILE.exists():
+        return ("No equity_curve.png found — run backtest.py first", 404)
+    return send_file(EQUITY_CURVE_FILE, mimetype="image/png")
+
+
+BACKTEST_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Backtest — ICT 2022</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:14px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+header h1{font-size:1.1rem;color:#e6edf3;font-weight:600}
+.back{padding:4px 14px;border-radius:12px;background:#21262d;color:#c9d1d9;font-size:.75rem;font-weight:700;text-decoration:none}
+.back:hover{background:#30363d}
+main{padding:20px 24px;display:flex;flex-direction:column;gap:20px}
+.row{display:grid;gap:16px}
+.cols-4{grid-template-columns:repeat(4,1fr)}
+.cols-3{grid-template-columns:repeat(3,1fr)}
+.cols-2{grid-template-columns:repeat(2,1fr)}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px}
+.card h2{font-size:.78rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
+.stat-val{font-size:1.6rem;font-weight:700;color:#e6edf3}
+.stat-val.green{color:#3fb950}.stat-val.red{color:#f85149}.stat-val.blue{color:#58a6ff}
+.stat-sub{font-size:.75rem;color:#8b949e;margin-top:3px}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{text-align:left;padding:8px 10px;color:#8b949e;font-weight:500;border-bottom:1px solid #30363d;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+td{padding:8px 10px;border-bottom:1px solid #21262d;color:#c9d1d9}
+tr:last-child td{border-bottom:none}
+.win{color:#3fb950;font-weight:600}.loss{color:#f85149;font-weight:600}
+.no-data{color:#8b949e;font-size:.82rem;padding:12px 0}
+canvas{max-height:260px}
+.chart-img{width:100%;border-radius:6px;background:#0d1117}
+.badge{padding:3px 10px;border-radius:12px;font-size:.72rem;font-weight:700;background:#1f6feb;color:#fff}
+@media(max-width:900px){.cols-4,.cols-3{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.cols-4,.cols-3,.cols-2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>ICT 2022 — Backtest Results</h1>
+  <span class="badge">US100</span>
+  <a href="/" class="back" style="margin-left:auto">← Live Dashboard</a>
+</header>
+<main>
+
+  <!-- Summary stats -->
+  <div class="row cols-4">
+    <div class="card"><h2>Total Trades</h2>
+      <div class="stat-val blue" id="total">—</div>
+      <div class="stat-sub" id="wl-sub">—</div></div>
+    <div class="card"><h2>Win Rate</h2>
+      <div class="stat-val" id="wr">—</div>
+      <div class="stat-sub">% of trades profitable</div></div>
+    <div class="card"><h2>Profit Factor</h2>
+      <div class="stat-val" id="pf">—</div>
+      <div class="stat-sub">Gross win / gross loss</div></div>
+    <div class="card"><h2>Net Points</h2>
+      <div class="stat-val" id="net">—</div>
+      <div class="stat-sub" id="dd-sub">—</div></div>
+  </div>
+
+  <!-- Equity curve chart.js -->
+  <div class="card">
+    <h2>Equity Curve</h2>
+    <canvas id="equity-chart"></canvas>
+  </div>
+
+  <!-- Equity curve image from backtest.py (richer chart) -->
+  <div class="card" id="img-card" style="display:none">
+    <h2>Full Backtest Chart (from backtest.py)</h2>
+    <img id="equity-img" class="chart-img" src="/backtest/chart" alt="equity curve"
+         onerror="document.getElementById('img-card').style.display='none'">
+  </div>
+
+  <!-- Monthly + Session -->
+  <div class="row cols-2">
+    <div class="card">
+      <h2>Monthly Breakdown</h2>
+      <div id="monthly-wrap"><p class="no-data">No data</p></div>
+    </div>
+    <div class="card">
+      <h2>Session Breakdown</h2>
+      <div id="session-wrap"><p class="no-data">No data</p></div>
+    </div>
+  </div>
+
+  <!-- Recent trades table -->
+  <div class="card">
+    <h2>Trade Log (last 50)</h2>
+    <div id="trades-wrap"><p class="no-data">No data</p></div>
+  </div>
+
+</main>
+<script>
+let eqChart = null;
+
+async function load() {
+  const r = await fetch('/api/backtest');
+  const d = await r.json();
+
+  if (!d.total) {
+    document.querySelector('main').innerHTML =
+      '<div class="card"><p class="no-data" style="padding:24px">No backtest_results.csv found — run <code>python backtest.py</code> first.</p></div>';
+    return;
+  }
+
+  document.getElementById('total').textContent = d.total;
+  document.getElementById('wl-sub').textContent = d.wins + 'W / ' + d.losses + 'L';
+
+  const wrEl = document.getElementById('wr');
+  wrEl.textContent = d.win_rate + '%';
+  wrEl.className = 'stat-val ' + (d.win_rate >= 50 ? 'green' : 'red');
+
+  const pfEl = document.getElementById('pf');
+  pfEl.textContent = d.profit_factor ?? '∞';
+  pfEl.className = 'stat-val ' + ((d.profit_factor ?? 2) >= 1.5 ? 'green' : d.profit_factor >= 1 ? '' : 'red');
+
+  const netEl = document.getElementById('net');
+  netEl.textContent = (d.net >= 0 ? '+' : '') + d.net + ' pts';
+  netEl.className = 'stat-val ' + (d.net >= 0 ? 'green' : 'red');
+  document.getElementById('dd-sub').textContent = 'Max DD: ' + d.max_dd + ' pts';
+
+  // Equity curve
+  if (d.equity && d.equity.length > 1) {
+    const labels = d.equity.map((_, i) => i === 0 ? 'Start' : 'T' + i);
+    const ptColors = d.equity.map((v, i) => i === 0 ? '#8b949e' : d.equity[i] >= d.equity[i-1] ? '#3fb950' : '#f85149');
+    const ctx = document.getElementById('equity-chart').getContext('2d');
+    eqChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          data: d.equity,
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.08)',
+          borderWidth: 2,
+          pointRadius: 3,
+          pointBackgroundColor: ptColors,
+          fill: true,
+          tension: 0.3,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {legend: {display: false}, tooltip: {callbacks: {label: ctx => ctx.parsed.y + ' pts'}}},
+        scales: {
+          x: {ticks: {color:'#8b949e', maxTicksLimit:10, font:{size:10}}, grid:{color:'#21262d'}},
+          y: {ticks: {color:'#8b949e', font:{size:10}}, grid:{color:'#21262d'}}
+        }
+      }
+    });
+  }
+
+  // Show static image if it loads
+  document.getElementById('img-card').style.display = 'block';
+
+  // Monthly table
+  if (d.monthly && d.monthly.length) {
+    let h = '<table><thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win%</th><th>Net Pts</th></tr></thead><tbody>';
+    for (const m of d.monthly) {
+      const nc = m.net >= 0 ? 'win' : 'loss';
+      h += `<tr><td>${m.month}</td><td>${m.trades}</td><td class="win">${m.wins}</td><td class="loss">${m.losses}</td><td>${m.win_rate}%</td><td class="${nc}">${m.net >= 0 ? '+' : ''}${m.net}</td></tr>`;
+    }
+    h += '</tbody></table>';
+    document.getElementById('monthly-wrap').innerHTML = h;
+  }
+
+  // Session table
+  if (d.sessions && d.sessions.length) {
+    let h = '<table><thead><tr><th>Session</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win%</th><th>Net Pts</th></tr></thead><tbody>';
+    for (const s of d.sessions) {
+      const nc = s.net >= 0 ? 'win' : 'loss';
+      h += `<tr><td>${s.session}</td><td>${s.trades}</td><td class="win">${s.wins}</td><td class="loss">${s.losses}</td><td>${s.win_rate}%</td><td class="${nc}">${s.net >= 0 ? '+' : ''}${s.net}</td></tr>`;
+    }
+    h += '</tbody></table>';
+    document.getElementById('session-wrap').innerHTML = h;
+  }
+
+  // Trades table
+  if (d.trades && d.trades.length) {
+    let h = '<table><thead><tr><th>Time</th><th>Session</th><th>Result</th><th>Entry</th><th>SL</th><th>TP</th><th>PnL (pts)</th></tr></thead><tbody>';
+    for (const t of d.trades) {
+      const rc = t.result === 'win' ? 'win' : 'loss';
+      const pc = parseFloat(t.pnl_points) >= 0 ? 'win' : 'loss';
+      h += `<tr><td>${t.time}</td><td>${t.session||'—'}</td><td class="${rc}">${t.result.toUpperCase()}</td><td>${parseFloat(t.entry).toFixed(2)}</td><td style="color:#f85149">${parseFloat(t.sl).toFixed(2)}</td><td style="color:#3fb950">${parseFloat(t.tp).toFixed(2)}</td><td class="${pc}">${parseFloat(t.pnl_points)>=0?'+':''}${parseFloat(t.pnl_points).toFixed(2)}</td></tr>`;
+    }
+    h += '</tbody></table>';
+    document.getElementById('trades-wrap').innerHTML = h;
+  }
+}
+
+load();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/backtest")
+def backtest():
+    return render_template_string(BACKTEST_TEMPLATE)
 
 
 if __name__ == "__main__":

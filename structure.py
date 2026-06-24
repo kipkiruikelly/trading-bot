@@ -9,6 +9,7 @@ def get_candles(timeframe_str: str, count: int) -> pd.DataFrame:
         "M5": mt5.TIMEFRAME_M5,
         "M15": mt5.TIMEFRAME_M15,
         "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
     }
     tf = tf_map[timeframe_str]
     rates = mt5.copy_rates_from_pos(SYMBOL, tf, 0, count)
@@ -17,6 +18,16 @@ def get_candles(timeframe_str: str, count: int) -> pd.DataFrame:
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
     return df
+
+
+def h4_bias() -> str | None:
+    """Returns 'bullish' or 'bearish' based on EMA20 vs EMA50 on H4, or None on data failure."""
+    df = get_candles("H4", 60)  # ~10 days of H4 candles
+    if df.empty or len(df) < 50:
+        return None
+    ema20 = df["close"].ewm(span=20, adjust=False).mean().iloc[-1]
+    ema50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    return "bullish" if ema20 > ema50 else "bearish"
 
 
 def find_swings(df: pd.DataFrame, lookback: int = SWING_LOOKBACK):
@@ -46,7 +57,10 @@ def detect_mss(df: pd.DataFrame):
         return None
 
     last_candle = df.iloc[-1]
-    prev_candle = df.iloc[-2]
+
+    # Displacement threshold: break candle body must exceed 50% of 14-bar ATR
+    atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+    min_body = 0.5 * atr
 
     # --- Bearish MSS ---
     # Sweep last swing high then break below last swing low
@@ -61,7 +75,8 @@ def detect_mss(df: pd.DataFrame):
         )
         if swept_high:
             broke_low = last_candle["close"] < last_low_val
-            if broke_low:
+            body = abs(last_candle["close"] - last_candle["open"])
+            if broke_low and body >= min_body:
                 return {
                     "direction": "bearish",
                     "sweep_level": last_high_val,
@@ -79,7 +94,8 @@ def detect_mss(df: pd.DataFrame):
         )
         if swept_low:
             broke_high = last_candle["close"] > last_high_val
-            if broke_high:
+            body = abs(last_candle["close"] - last_candle["open"])
+            if broke_high and body >= min_body:
                 return {
                     "direction": "bullish",
                     "sweep_level": last_low_val,

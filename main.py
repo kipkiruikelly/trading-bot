@@ -7,7 +7,7 @@ from pathlib import Path
 
 from config import SYMBOL, STRUCTURE_TF, MAGIC, SLIPPAGE, DRY_RUN
 from killzone import in_kill_zone, active_session
-from structure import get_candles, detect_mss
+from structure import get_candles, detect_mss, h4_bias
 from entry import find_fvg, price_in_fvg
 from risk import calculate_lot_size, calculate_tp
 from ml_filter import extract_features, load_model, should_take_trade
@@ -188,9 +188,23 @@ def run():
                 time.sleep(10)
                 continue
 
+            # --- H4 trend filter ---
+            bias = h4_bias()
+            if bias is None:
+                log.debug("H4 bias unavailable — skipping")
+                time.sleep(10)
+                continue
+
             mss = detect_mss(df_15m)
             if mss is None or not mss["confirmed"]:
                 log.debug("No MSS detected — session: %s", active_session())
+                time.sleep(10)
+                continue
+
+            # Reject setups that trade against the H4 trend
+            if mss["direction"] != bias:
+                log.debug("MSS direction %s conflicts with H4 bias %s — skipping",
+                          mss["direction"], bias)
                 time.sleep(10)
                 continue
 
@@ -200,8 +214,8 @@ def run():
                 time.sleep(10)
                 continue
 
-            log.info("MSS confirmed | direction: %s | sweep: %.2f | break: %.2f",
-                     mss["direction"], mss["sweep_level"], mss["structure_break_level"])
+            log.info("MSS confirmed | direction: %s | H4 bias: %s | sweep: %.2f | break: %.2f",
+                     mss["direction"], bias, mss["sweep_level"], mss["structure_break_level"])
 
             # --- 1m FVG ---
             fvg = find_fvg(mss["direction"])
@@ -238,9 +252,9 @@ def run():
 
             current_price = (tick.bid + tick.ask) / 2
 
-            if not price_in_fvg(current_price, fvg):
-                log.debug("Price %.2f not in FVG [%.2f - %.2f] — waiting for retrace",
-                          current_price, fvg["bottom"], fvg["top"])
+            if not price_in_fvg(current_price, fvg, mss["direction"]):
+                log.debug("Price %.2f not in OTE zone [%.2f - %.2f] — waiting for retrace",
+                          current_price, fvg["bottom"], fvg["mid"] if mss["direction"] == "bullish" else fvg["top"])
                 time.sleep(5)
                 continue
 

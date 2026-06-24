@@ -46,5 +46,10 @@ def find_fvg(direction: str) -> dict | None:
     return fvgs[-1]
 
 
-def price_in_fvg(current_price: float, fvg: dict) -> bool:
+def price_in_fvg(current_price: float, fvg: dict, direction: str = "") -> bool:
+    # OTE: enter at the lower half of a bullish FVG, upper half of a bearish FVG
+    if direction == "bullish":
+        return fvg["bottom"] <= current_price <= fvg["mid"]
+    if direction == "bearish":
+        return fvg["mid"] <= current_price <= fvg["top"]
     return fvg["bottom"] <= current_price <= fvg["top"]
